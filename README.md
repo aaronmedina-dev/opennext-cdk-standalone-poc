@@ -10,6 +10,7 @@ This guide explains how to deploy a Next.js (page router) application on AWS wit
 - **Dynamic routing** for flexible URLs.
 - **Image optimization** for performance.
 - **Static assets** such as JSON files, served via CloudFront
+- **Warmer Function** Sends requests to configured endpoints to keep their corresponding Lmabda functions "warm".
 
 The architecture leverages **AWS Lambda**, **CloudFront**, and **S3** to provide a scalable and serverless deployment.
 
@@ -615,81 +616,92 @@ More information about the components [here](https://opennext.js.org/aws/inner_w
 7. **Static File**: Static data has been consumed in Homepage.
 
 
-# Warmer Implementation - WIP
+# Warmer Implementation
 
 ### Adding Warmer Components
 
 See diagram above for the architecture.
 
-1. Update code in `lib/serverless-nextjs-poc-stack.ts`
+The warmer components mitigate cold start issues in AWS Lambda by periodically invoking critical server-side routes. This ensures that Lambda functions remain initialized and reduce latency for the first request. Additionally, the warmer ensures that CloudFront-cached pages or ISR paths are refreshed, enhancing performance and user experience.
 
-    ```typescript
-        import { Stack, StackProps, Duration } from 'aws-cdk-lib';
-        import { Construct } from 'constructs';
-        import { Nextjs } from 'cdk-nextjs-standalone';
-        import { Function, Runtime, Code } from 'aws-cdk-lib/aws-lambda';
-        import { Rule, Schedule } from 'aws-cdk-lib/aws-events';
-        import { LambdaFunction } from 'aws-cdk-lib/aws-events-targets';
+#### How It Works
 
-        export class ServerlessNextjsPocStack extends Stack {
-            constructor(scope: Construct, id: string, props?: StackProps) {
-                super(scope, id, props);
+The warmer components consist of:
 
-                const nextJsSite = new Nextjs(this, 'NextjsSite', {
-                    nextjsPath: './nextjs-app', // Path to the built Next.js app
-                });
+- **Warmer Lambda Function**: Sends periodic `GET` requests to endpoints (SSR, ISR, API routes) to keep their corresponding Lambda functions "warm."
+- **EventBridge Rule**: Acts as a scheduler, triggering the warmer Lambda function every 5 minutes (configurable).
+- **Integration**: The warmer targets endpoints served through CloudFront, ensuring that both Lambda functions and cached content remain up-to-date.
 
-                //Define Warmer Lambda Function
-                const warmer = new Function(this, 'Warmer', {
-                    runtime: Runtime.NODEJS_18_X,
-                    handler: 'index.handler',
-                    code: Code.fromInline(`
-                        const https = require('https');
 
-                        exports.handler = async function() {
-                        const baseUrl = process.env.CLOUDFRONT_URL;  // Base Dynamic CloudFront URL from environment variables
-                        const paths = process.env.WARMER_PATHS.split(','); // Comma-separated paths from environment variables
+Step 1. Update code in `lib/serverless-nextjs-poc-stack.ts`
 
-                        // Loop through each path and send a request to keep the corresponding Lambda warm
-                        for (const path of paths) {
-                            const url = \`\${baseUrl}\${path}\`;  // Construct the full URL (CloudFront URL + path)
+```typescript
+import { Stack, StackProps, Duration } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import { Nextjs } from 'cdk-nextjs-standalone';
+import { Function, Runtime, Code } from 'aws-cdk-lib/aws-lambda';
+import { Rule, Schedule } from 'aws-cdk-lib/aws-events';
+import { LambdaFunction } from 'aws-cdk-lib/aws-events-targets';
 
-                            // Make an HTTPS GET request to the URL
-                            await new Promise((resolve, reject) => {
-                            https.get(url, (res) => {
-                                // Log success response for each warmed endpoint
-                                console.log(\`Warmed: \${url}, Status Code: \${res.statusCode}\`);
-                                resolve(); // Resolve the promise on success
-                            }).on('error', (err) => {
-                                // Log error if the request fails
-                                console.error(\`Error warming: \${url}, \`, err);
-                                reject(err); // Reject the promise on error
-                            });
-                            });
-                        }
-                        };
-                            
-                    `),
-                    timeout: Duration.seconds(30), // Set the Lambda timeout to 30 seconds
-                    environment: {
-                        CLOUDFRONT_URL: `https://${nextJsSite.distribution.distributionDomain}`, // Dynamic CloudFront domain name for the Next.js app
-                        WARMER_PATHS: '/api/hello', //You can add multiple paths here separated by comma
-                    },
-                });
+export class ServerlessNextjsPocStack extends Stack {
+    constructor(scope: Construct, id: string, props?: StackProps) {
+        super(scope, id, props);
 
-                // Schedule the warmer to run every X minutes
-                const warmerRule = new Rule(this, 'WarmerRule', {
-                    schedule: Schedule.rate(Duration.minutes(5)),
-                    targets: [new LambdaFunction(warmer)],
-                });
-            }
-        }
-    ```
+        const nextJsSite = new Nextjs(this, 'NextjsSite', {
+            nextjsPath: './nextjs-app', // Path to the built Next.js app
+        });
 
-    We have added here a Warmer Lambda Function and Eventbridge rule for invoking the Lambda function every X minutes.
-    Paths should be added to `WARMER_PATHS:` separated by comma (,).
+        //Define Warmer Lambda Function
+        const warmer = new Function(this, 'Warmer', {
+            runtime: Runtime.NODEJS_18_X,
+            handler: 'index.handler',
+            code: Code.fromInline(`
+                const https = require('https');
 
-2. Rebuild and Deploy. 
+                exports.handler = async function() {
+                const baseUrl = process.env.CLOUDFRONT_URL;  // Base Dynamic CloudFront URL from environment variables
+                const paths = process.env.WARMER_PATHS.split(','); // Comma-separated paths from environment variables
+
+                // Loop through each path and send a request to keep the corresponding Lambda warm
+                for (const path of paths) {
+                    const url = \`\${baseUrl}\${path}\`;  // Construct the full URL (CloudFront URL + path)
+
+                    // Make an HTTPS GET request to the URL
+                    await new Promise((resolve, reject) => {
+                    https.get(url, (res) => {
+                        // Log success response for each warmed endpoint
+                        console.log(\`Warmed: \${url}, Status Code: \${res.statusCode}\`);
+                        resolve(); // Resolve the promise on success
+                    }).on('error', (err) => {
+                        // Log error if the request fails
+                        console.error(\`Error warming: \${url}, \`, err);
+                        reject(err); // Reject the promise on error
+                    });
+                    });
+                }
+                };
+                    
+            `),
+            timeout: Duration.seconds(30), // Set the Lambda timeout to 30 seconds
+            environment: {
+                CLOUDFRONT_URL: `https://${nextJsSite.distribution.distributionDomain}`, // Dynamic CloudFront domain name for the Next.js app
+                WARMER_PATHS: '/api/hello', //You can add multiple paths here separated by comma
+            },
+        });
+
+        // Schedule the warmer to run every X minutes
+        const warmerRule = new Rule(this, 'WarmerRule', {
+            schedule: Schedule.rate(Duration.minutes(5)),
+            targets: [new LambdaFunction(warmer)],
+        });
+    }
+}
+```
+
+We have added here a Warmer Lambda Function and Eventbridge rule for invoking the Lambda function every X minutes.
+Paths should be added to `WARMER_PATHS:` separated by comma (,).
+
+Step 2. Rebuild and Deploy. 
 
     You should be able to see the new Rule created in Eventbridge targetting the Lambda function containing the inline script.
 
